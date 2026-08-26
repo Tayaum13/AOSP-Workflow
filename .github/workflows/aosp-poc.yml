@@ -1,0 +1,377 @@
+name: AOSP Proof of Concept
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: aosp-poc
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    # GitHub's hosted runner limit is around 6 hours.
+    # Stop ourselves before reaching it.
+    timeout-minutes: 350
+
+    steps:
+
+      # ==========================================================
+      # 1. Checkout YOUR repository
+      # ==========================================================
+
+      - name: Checkout MyOS
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 2. Remove unnecessary software from runner
+      # ==========================================================
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -eux
+
+          echo "Before cleanup:"
+          df -h
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/powershell
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "After cleanup:"
+          df -h
+
+      # ==========================================================
+      # 3. Show hardware
+      # ==========================================================
+
+      - name: Show runner resources
+        run: |
+          echo "CPU:"
+          nproc
+
+          echo
+          echo "RAM:"
+          free -h
+
+          echo
+          echo "DISK:"
+          df -h
+
+      # ==========================================================
+      # 4. Install build dependencies
+      # ==========================================================
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            git-lfs \
+            gnupg \
+            flex \
+            bison \
+            build-essential \
+            zip \
+            curl \
+            unzip \
+            zstd \
+            rsync \
+            bc \
+            ccache \
+            python3 \
+            python-is-python3 \
+            libssl-dev \
+            libelf-dev \
+            libxml2-utils \
+            xsltproc \
+            lz4
+
+      # ==========================================================
+      # 5. Install repo
+      # ==========================================================
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+
+          curl -L \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+
+          chmod +x "$HOME/bin/repo"
+
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      # ==========================================================
+      # 6. Create compressed RAM
+      #
+      # zram uses RAM as a compressed swap device.
+      # This is much faster than disk swap.
+      # ==========================================================
+
+      - name: Configure zram
+        shell: bash
+        run: |
+          set -eux
+
+          sudo apt-get install -y zram-tools
+
+          sudo modprobe zram
+
+          if [ -e /sys/class/zram-control/hot_add ]; then
+            echo 0 | sudo tee /sys/class/zram-control/hot_add
+          fi
+
+          ZRAM_DEV=$(ls /dev/zram* 2>/dev/null | head -n1 || true)
+
+          if [ -n "$ZRAM_DEV" ]; then
+            echo "Using $ZRAM_DEV"
+
+            sudo swapoff "$ZRAM_DEV" 2>/dev/null || true
+
+            echo $((2 * 1024 * 1024 * 1024)) | \
+              sudo tee /sys/block/$(basename "$ZRAM_DEV")/disksize
+
+            sudo mkswap "$ZRAM_DEV"
+            sudo swapon -p 100 "$ZRAM_DEV"
+          fi
+
+          free -h
+          swapon --show
+
+      # ==========================================================
+      # 7. Create disk swap
+      #
+      # This is fallback memory, not primary memory.
+      # ==========================================================
+
+      - name: Configure disk swap
+        run: |
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon -p 10 /swapfile
+
+          free -h
+          swapon --show
+
+      # ==========================================================
+      # 8. Restore ccache
+      # ==========================================================
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ccache
+          key: aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            aosp-ccache-${{ runner.os }}-
+
+      # ==========================================================
+      # 9. Configure ccache
+      # ==========================================================
+
+      - name: Configure ccache
+        run: |
+          mkdir -p "$HOME/ccache"
+
+          ccache -M 10G
+
+          echo "USE_CCACHE=1" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$HOME/ccache" >> "$GITHUB_ENV"
+
+          ccache -s
+
+      # ==========================================================
+      # 10. Restore previous build checkpoint
+      # ==========================================================
+
+      - name: Restore build checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aosp-checkpoint-*
+          path: checkpoint
+          merge-multiple: true
+        continue-on-error: true
+
+      # ==========================================================
+      # 11. Initialize AOSP
+      # ==========================================================
+
+      - name: Initialize AOSP
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/aosp"
+
+          cd "$GITHUB_WORKSPACE/aosp"
+
+          repo init \
+            -u https://android.googlesource.com/platform/manifest \
+            -b android-latest-release \
+            --partial-clone \
+            --no-use-superproject
+
+      # ==========================================================
+      # 12. Sync AOSP
+      #
+      # Current branch only + no tags saves storage.
+      # ==========================================================
+
+      - name: Sync AOSP
+        working-directory: aosp
+        run: |
+          repo sync \
+            -c \
+            --no-tags \
+            --optimized-fetch \
+            --prune \
+            -j2
+
+      # ==========================================================
+      # 13. Restore previous out directory if available
+      # ==========================================================
+
+      - name: Restore previous out directory
+        run: |
+          if [ -d checkpoint/out ]; then
+            echo "Restoring previous build state..."
+
+            mkdir -p aosp/out
+
+            rsync -a \
+              checkpoint/out/ \
+              aosp/out/
+          else
+            echo "No previous checkpoint."
+          fi
+
+      # ==========================================================
+      # 14. Build
+      #
+      # 340 minutes = 5h40.
+      # Leaves ~20 minutes of safety margin.
+      # ==========================================================
+
+      - name: Build AOSP
+        working-directory: aosp
+        run: |
+          set +e
+
+          source build/envsetup.sh
+
+          lunch aosp_cf_x86_64_phone-userdebug
+
+          timeout --signal=TERM --kill-after=60s 340m \
+            m -j2
+
+          STATUS=$?
+
+          echo "Build exit status: $STATUS"
+
+          if [ "$STATUS" -eq 124 ]; then
+            echo "BUILD_CHECKPOINT=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          exit "$STATUS"
+
+      # ==========================================================
+      # 15. Show build statistics
+      # ==========================================================
+
+      - name: Build statistics
+        if: always()
+        run: |
+          echo "========== DISK =========="
+          df -h
+
+          echo
+          echo "========== MEMORY =========="
+          free -h
+
+          echo
+          echo "========== SWAP =========="
+          swapon --show
+
+          echo
+          echo "========== CCACHE =========="
+          ccache -s || true
+
+          echo
+          echo "========== OUT SIZE =========="
+          du -sh aosp/out 2>/dev/null || true
+
+      # ==========================================================
+      # 16. Save ccache
+      # ==========================================================
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ccache
+          key: aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      # ==========================================================
+      # 17. Compress checkpoint
+      #
+      # Only the inactive checkpoint is compressed.
+      # We NEVER compress the live build directory while Ninja
+      # is compiling.
+      # ==========================================================
+
+      - name: Create checkpoint archive
+        if: env.BUILD_CHECKPOINT == 'true'
+        run: |
+          mkdir -p checkpoint
+
+          rsync -a \
+            aosp/out/ \
+            checkpoint/out/
+
+          tar \
+            --use-compress-program='zstd -T0 -3' \
+            -cf aosp-checkpoint.tar.zst \
+            checkpoint/out
+
+          ls -lh aosp-checkpoint.tar.zst
+
+      # ==========================================================
+      # 18. Upload checkpoint
+      # ==========================================================
+
+      - name: Upload checkpoint
+        if: env.BUILD_CHECKPOINT == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-checkpoint-${{ github.run_id }}
+          path: aosp-checkpoint.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+      # ==========================================================
+      # 19. Upload finished images
+      # ==========================================================
+
+      - name: Upload final images
+        if: env.BUILD_CHECKPOINT != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-final-${{ github.run_id }}
+          path: |
+            aosp/out/target/product/**/*.img
+            aosp/out/target/product/**/*.zip
+          compression-level: 0
+          retention-days: 7
