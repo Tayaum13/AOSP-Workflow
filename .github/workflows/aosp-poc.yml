@@ -12,6 +12,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
+
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
@@ -101,33 +102,6 @@ jobs:
 
           "$HOME/bin/repo" --version
 
-      - name: Configure additional swap
-        shell: bash
-        run: |
-          set -eux
-
-          echo "=== EXISTING SWAP ==="
-          swapon --show || true
-
-          if [ ! -f /aosp-swapfile ]; then
-            sudo fallocate -l 24G /aosp-swapfile
-            sudo chmod 600 /aosp-swapfile
-            sudo mkswap /aosp-swapfile
-          fi
-
-          sudo swapon -p 10 /aosp-swapfile || true
-
-          sudo sysctl -w vm.swappiness=10
-
-          echo "=== MEMORY ==="
-          free -h
-
-          echo "=== SWAP ==="
-          swapon --show
-
-          echo "=== DISK ==="
-          df -h
-
       - name: Configure ccache
         shell: bash
         run: |
@@ -140,6 +114,7 @@ jobs:
           echo "USE_CCACHE=1" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$HOME/ccache" >> "$GITHUB_ENV"
 
+          echo "=== CCACHE ==="
           ccache -s
 
       - name: Initialize AOSP
@@ -157,6 +132,24 @@ jobs:
             -b android-latest-release \
             -u https://android.googlesource.com/platform/manifest
 
+      - name: Check storage before sync
+        working-directory: aosp
+        shell: bash
+        run: |
+          set -eux
+
+          echo "=== STORAGE BEFORE AOSP SYNC ==="
+          df -h .
+
+          echo "=== INODES BEFORE AOSP SYNC ==="
+          df -i .
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== SWAP ==="
+          swapon --show || true
+
       - name: Sync AOSP
         working-directory: aosp
         shell: bash
@@ -164,13 +157,33 @@ jobs:
           set -eux
 
           echo "=== AOSP SYNC ==="
-          echo "Using 4 parallel jobs to reduce checkout pressure."
 
           repo sync \
             -c \
             -j4 \
             --force-sync \
             --fail-fast
+
+      - name: Check storage after sync
+        working-directory: aosp
+        shell: bash
+        run: |
+          set -eux
+
+          echo "=== STORAGE AFTER AOSP SYNC ==="
+          df -h .
+
+          echo "=== INODES AFTER AOSP SYNC ==="
+          df -i .
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== SWAP ==="
+          swapon --show || true
+
+          echo "=== AOSP SIZE ==="
+          du -sh .
 
       - name: Verify AOSP checkout
         working-directory: aosp
@@ -181,20 +194,41 @@ jobs:
           echo "=== REPO STATUS ==="
           repo status
 
-          echo "=== DISK ==="
-          df -h
+          echo "=== CHECKING CRITICAL DIRECTORIES ==="
 
-          echo "=== INODES ==="
-          df -i
+          test -d build
+          test -d frameworks
+          test -d packages
+          test -d system
 
-          echo "=== MEMORY ==="
-          free -h
+          echo "=== AOSP CHECKOUT LOOKS VALID ==="
 
-          echo "=== SWAP ==="
-          swapon --show
+      - name: Check whether enough space remains for build
+        working-directory: aosp
+        shell: bash
+        run: |
+          set -eux
 
-          echo "=== AOSP SIZE ==="
-          du -sh .
+          AVAILABLE_KB=$(df -Pk . | awk 'NR==2 {print $4}')
+          AVAILABLE_GB=$((AVAILABLE_KB / 1024 / 1024))
+
+          echo "Available space: ${AVAILABLE_GB} GB"
+
+          if [ "$AVAILABLE_GB" -lt 35 ]; then
+            echo ""
+            echo "=========================================="
+            echo "NOT ENOUGH SPACE FOR A SAFE BUILD"
+            echo "=========================================="
+            echo ""
+            echo "AOSP sync succeeded."
+            echo "Remaining storage is only ${AVAILABLE_GB} GB."
+            echo ""
+            echo "This is useful data: the source tree itself"
+            echo "is consuming most of the runner storage."
+            echo ""
+            echo "Skipping compilation."
+            exit 78
+          fi
 
       - name: Build AOSP
         working-directory: aosp
@@ -212,25 +246,36 @@ jobs:
         if: always()
         shell: bash
         run: |
+          echo "=========================================="
+          echo "FINAL DIAGNOSTICS"
+          echo "=========================================="
+
+          echo ""
           echo "=== DISK ==="
           df -h
 
+          echo ""
           echo "=== INODES ==="
           df -i
 
+          echo ""
           echo "=== MEMORY ==="
           free -h
 
+          echo ""
           echo "=== SWAP ==="
           swapon --show || true
 
+          echo ""
           echo "=== CCACHE ==="
           ccache -s || true
 
+          echo ""
           echo "=== AOSP SIZE ==="
           du -sh aosp 2>/dev/null || true
 
-          echo "=== OUTPUT SIZE ==="
+          echo ""
+          echo "=== OUT SIZE ==="
           du -sh aosp/out 2>/dev/null || true
 
       - name: Save ccache
