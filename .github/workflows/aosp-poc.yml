@@ -1,25 +1,206 @@
-- name: Configure swap
-  shell: bash
-  run: |
-    set -eux
+name: AOSP Proof of Concept
 
-    echo "=== Memory before swap ==="
-    free -h
+on:
+  workflow_dispatch:
 
-    echo "=== Existing swap ==="
-    swapon --show || true
+permissions:
+  actions: write
+  contents: read
 
-    # Create 16 GB disk-backed swap.
-    sudo fallocate -l 16G /swapfile
-    sudo chmod 600 /swapfile
-    sudo mkswap /swapfile
-    sudo swapon -p 10 /swapfile
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
 
-    # Make Linux prefer RAM over swap.
-    sudo sysctl -w vm.swappiness=10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-    echo "=== Memory after swap ==="
-    free -h
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -eu
 
-    echo "=== Swap ==="
-    swapon --show
+          echo "=== BEFORE CLEANUP ==="
+          df -h
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/powershell
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "=== AFTER CLEANUP ==="
+          df -h
+
+      - name: Show runner resources
+        run: |
+          echo "=== CPU ==="
+          nproc
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== STORAGE ==="
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            git-lfs \
+            gnupg \
+            flex \
+            bison \
+            build-essential \
+            zip \
+            curl \
+            unzip \
+            zstd \
+            rsync \
+            bc \
+            ccache \
+            python3 \
+            python-is-python3 \
+            libssl-dev \
+            libelf-dev \
+            libxml2-utils \
+            xsltproc \
+            lz4
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+
+          curl -L \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+
+          chmod +x "$HOME/bin/repo"
+
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure swap
+        shell: bash
+        run: |
+          set -eu
+
+          echo "=== EXISTING SWAP ==="
+          swapon --show || true
+
+          sudo fallocate -l 24G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon -p 10 /swapfile
+
+          sudo sysctl -w vm.swappiness=10
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== SWAP ==="
+          swapon --show
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ~/ccache
+          key: aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            aosp-ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p "$HOME/ccache"
+
+          ccache -M 5G
+
+          echo "USE_CCACHE=1" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$HOME/ccache" >> "$GITHUB_ENV"
+
+          ccache -s
+
+      - name: Initialize AOSP
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/aosp"
+
+          cd "$GITHUB_WORKSPACE/aosp"
+
+          repo init \
+            -u https://android.googlesource.com/platform/manifest \
+            -b android-latest-release \
+            --partial-clone \
+            --no-use-superproject
+
+      - name: Sync AOSP
+        working-directory: aosp
+        run: |
+          repo sync \
+            -c \
+            --no-tags \
+            --optimized-fetch \
+            --prune \
+            -j2
+
+      - name: Check AOSP size
+        run: |
+          echo "=== DISK ==="
+          df -h
+
+          echo "=== AOSP SIZE ==="
+          du -sh "$GITHUB_WORKSPACE/aosp"
+
+      - name: Build AOSP
+        working-directory: aosp
+        run: |
+          source build/envsetup.sh
+
+          lunch aosp_cf_x86_64_phone-userdebug
+
+          m -j2
+
+      - name: Show build result
+        if: always()
+        run: |
+          echo "=== DISK ==="
+          df -h
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== SWAP ==="
+          swapon --show
+
+          echo "=== CCACHE ==="
+          ccache -s || true
+
+          echo "=== OUTPUT ==="
+          find aosp/out/target/product \
+            -type f \
+            \( -name "*.img" -o -name "*.zip" \) \
+            -exec ls -lh {} \; 2>/dev/null || true
+
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ccache
+          key: aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload Android images
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-proof-of-concept
+          path: |
+            aosp/out/target/product/**/*.img
+            aosp/out/target/product/**/*.zip
+          if-no-files-found: warn
+          retention-days: 7
