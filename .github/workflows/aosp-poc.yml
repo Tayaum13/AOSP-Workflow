@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   build:
@@ -13,42 +12,50 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v6
 
-      - name: Clean runner
+      - name: Free disk space
         shell: bash
         run: |
           set -eu
-          echo "Disk before cleanup:"
+
+          echo "=== BEFORE CLEANUP ==="
           df -h
+          df -i
 
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/powershell
           sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
-          echo "Disk after cleanup:"
+          echo "=== AFTER CLEANUP ==="
           df -h
+          df -i
 
       - name: Show runner resources
         shell: bash
         run: |
           set -eu
-          echo "CPU:"
+
+          echo "=== CPU ==="
           nproc
 
-          echo "Memory:"
+          echo "=== MEMORY ==="
           free -h
 
-          echo "Disk:"
+          echo "=== DISK ==="
           df -h
 
-          echo "Existing swap:"
+          echo "=== INODES ==="
+          df -i
+
+          echo "=== SWAP ==="
           swapon --show || true
 
-      - name: Install build dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           set -eu
@@ -97,37 +104,24 @@ jobs:
         run: |
           set -eu
 
-          echo "Existing swap:"
+          echo "=== EXISTING SWAP ==="
           swapon --show || true
 
-          if [ ! -f /aosp-swapfile ]; then
-            sudo fallocate -l 24G /aosp-swapfile
-            sudo chmod 600 /aosp-swapfile
-            sudo mkswap /aosp-swapfile
-          fi
-
-          sudo swapon -p 10 /aosp-swapfile || true
+          sudo fallocate -l 24G /aosp-swapfile
+          sudo chmod 600 /aosp-swapfile
+          sudo mkswap /aosp-swapfile
+          sudo swapon -p 10 /aosp-swapfile
 
           sudo sysctl -w vm.swappiness=10
 
-          echo "Memory:"
+          echo "=== MEMORY ==="
           free -h
 
-          echo "Swap:"
+          echo "=== SWAP ==="
           swapon --show
 
-          echo "Disk:"
+          echo "=== DISK ==="
           df -h
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
-        continue-on-error: true
-        with:
-          path: ~/ccache
-          key: aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            aosp-ccache-${{ runner.os }}-${{ github.ref_name }}-
-            aosp-ccache-${{ runner.os }}-
 
       - name: Configure ccache
         shell: bash
@@ -146,53 +140,74 @@ jobs:
       - name: Initialize AOSP
         shell: bash
         run: |
-          set -eu
+          set -eux
 
           mkdir -p "$GITHUB_WORKSPACE/aosp"
-
           cd "$GITHUB_WORKSPACE/aosp"
 
           repo init \
-            -u https://android.googlesource.com/platform/manifest \
-            -b android-latest-release \
             --partial-clone \
-            --no-use-superproject
+            --no-use-superproject \
+            -b android-latest-release \
+            -u https://android.googlesource.com/platform/manifest
 
       - name: Sync AOSP
         working-directory: aosp
         shell: bash
         run: |
-          set -eu
+          set -eux
+
+          echo "=== FIRST SYNC ==="
 
           repo sync \
             -c \
-            --no-tags \
-            --optimized-fetch \
-            --prune \
-            -j2
+            -j8
 
-      - name: Check AOSP storage
+      - name: Repair failed checkout
+        if: failure()
+        working-directory: aosp
         shell: bash
         run: |
-          set -eu
+          set -eux
 
-          echo "Filesystem:"
+          echo "=== CHECKING CUTTLEFISH VMM ==="
+
+          if [ -d device/google/cuttlefish_vmm ]; then
+            git -C device/google/cuttlefish_vmm status || true
+          fi
+
+          echo "=== FORCE SYNC ==="
+
+          repo sync \
+            -c \
+            -j4 \
+            --force-sync \
+            device/google/cuttlefish_vmm
+
+      - name: Verify AOSP checkout
+        shell: bash
+        run: |
+          set -eux
+
+          cd aosp
+
+          echo "=== REPO STATUS ==="
+          repo status
+
+          echo "=== DISK ==="
           df -h
 
-          echo "AOSP size:"
-          du -sh "$GITHUB_WORKSPACE/aosp"
+          echo "=== INODES ==="
+          df -i
 
-          echo "Memory:"
-          free -h
-
-          echo "Swap:"
-          swapon --show
+          echo "=== AOSP SIZE ==="
+          du -sh .
 
       - name: Build AOSP
         working-directory: aosp
         shell: bash
         run: |
-          set -eu
+          set -eux
 
           source build/envsetup.sh
 
@@ -200,27 +215,27 @@ jobs:
 
           m -j2
 
-      - name: Show build results
+      - name: Build diagnostics
         if: always()
         shell: bash
         run: |
-          echo "Filesystem:"
+          echo "=== DISK ==="
           df -h
 
-          echo "Memory:"
+          echo "=== INODES ==="
+          df -i
+
+          echo "=== MEMORY ==="
           free -h
 
-          echo "Swap:"
-          swapon --show
+          echo "=== SWAP ==="
+          swapon --show || true
 
-          echo "ccache:"
+          echo "=== CCACHE ==="
           ccache -s || true
 
-          echo "Android images:"
-          find aosp/out/target/product \
-            -type f \
-            \( -name "*.img" -o -name "*.zip" \) \
-            -exec ls -lh {} \; 2>/dev/null || true
+          echo "=== AOSP SIZE ==="
+          du -sh aosp 2>/dev/null || true
 
       - name: Save ccache
         if: always()
