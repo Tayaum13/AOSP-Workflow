@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: read
+  actions: write
 
 jobs:
   build:
@@ -16,38 +16,43 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Free disk space
+      - name: Clean runner
         shell: bash
         run: |
           set -eu
-
-          echo "=== BEFORE CLEANUP ==="
+          echo "Disk before cleanup:"
           df -h
 
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/powershell
-
           sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
 
-          echo "=== AFTER CLEANUP ==="
+          echo "Disk after cleanup:"
           df -h
 
       - name: Show runner resources
+        shell: bash
         run: |
-          echo "=== CPU ==="
+          set -eu
+          echo "CPU:"
           nproc
 
-          echo "=== MEMORY ==="
+          echo "Memory:"
           free -h
 
-          echo "=== STORAGE ==="
+          echo "Disk:"
           df -h
 
-      - name: Install dependencies
+          echo "Existing swap:"
+          swapon --show || true
+
+      - name: Install build dependencies
+        shell: bash
         run: |
+          set -eu
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -73,7 +78,10 @@ jobs:
             lz4
 
       - name: Install repo
+        shell: bash
         run: |
+          set -eu
+
           mkdir -p "$HOME/bin"
 
           curl -L \
@@ -84,26 +92,32 @@ jobs:
 
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Configure swap
+      - name: Configure additional swap
         shell: bash
         run: |
           set -eu
 
-          echo "=== EXISTING SWAP ==="
+          echo "Existing swap:"
           swapon --show || true
 
-          sudo fallocate -l 24G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon -p 10 /swapfile
+          if [ ! -f /aosp-swapfile ]; then
+            sudo fallocate -l 24G /aosp-swapfile
+            sudo chmod 600 /aosp-swapfile
+            sudo mkswap /aosp-swapfile
+          fi
+
+          sudo swapon -p 10 /aosp-swapfile || true
 
           sudo sysctl -w vm.swappiness=10
 
-          echo "=== MEMORY ==="
+          echo "Memory:"
           free -h
 
-          echo "=== SWAP ==="
+          echo "Swap:"
           swapon --show
+
+          echo "Disk:"
+          df -h
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
@@ -116,7 +130,10 @@ jobs:
             aosp-ccache-${{ runner.os }}-
 
       - name: Configure ccache
+        shell: bash
         run: |
+          set -eu
+
           mkdir -p "$HOME/ccache"
 
           ccache -M 5G
@@ -127,7 +144,10 @@ jobs:
           ccache -s
 
       - name: Initialize AOSP
+        shell: bash
         run: |
+          set -eu
+
           mkdir -p "$GITHUB_WORKSPACE/aosp"
 
           cd "$GITHUB_WORKSPACE/aosp"
@@ -140,7 +160,10 @@ jobs:
 
       - name: Sync AOSP
         working-directory: aosp
+        shell: bash
         run: |
+          set -eu
+
           repo sync \
             -c \
             --no-tags \
@@ -148,39 +171,52 @@ jobs:
             --prune \
             -j2
 
-      - name: Check AOSP size
+      - name: Check AOSP storage
+        shell: bash
         run: |
-          echo "=== DISK ==="
+          set -eu
+
+          echo "Filesystem:"
           df -h
 
-          echo "=== AOSP SIZE ==="
+          echo "AOSP size:"
           du -sh "$GITHUB_WORKSPACE/aosp"
+
+          echo "Memory:"
+          free -h
+
+          echo "Swap:"
+          swapon --show
 
       - name: Build AOSP
         working-directory: aosp
+        shell: bash
         run: |
+          set -eu
+
           source build/envsetup.sh
 
           lunch aosp_cf_x86_64_phone-userdebug
 
           m -j2
 
-      - name: Show build result
+      - name: Show build results
         if: always()
+        shell: bash
         run: |
-          echo "=== DISK ==="
+          echo "Filesystem:"
           df -h
 
-          echo "=== MEMORY ==="
+          echo "Memory:"
           free -h
 
-          echo "=== SWAP ==="
+          echo "Swap:"
           swapon --show
 
-          echo "=== CCACHE ==="
+          echo "ccache:"
           ccache -s || true
 
-          echo "=== OUTPUT ==="
+          echo "Android images:"
           find aosp/out/target/product \
             -type f \
             \( -name "*.img" -o -name "*.zip" \) \
